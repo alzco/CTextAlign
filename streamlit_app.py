@@ -1,4 +1,5 @@
 import streamlit as st
+import time
 import pandas as pd
 import numpy as np
 import re
@@ -35,7 +36,7 @@ st.set_page_config(
 # Suppress verbose output from jieba
 jieba.setLogLevel(logging.INFO)
 
-MAX_DOCS = 2
+MAX_DOCS = 5
 DOC_LABELS_AVAILABLE = [chr(65 + i) for i in range(MAX_DOCS)] # 这会自动变成 ['A', 'B']
 
 class ChineseTextProcessor:
@@ -107,6 +108,17 @@ class ChineseTextProcessor:
             return "" # Return empty string on error
 
 class ChineseSegmenter:
+    def __init__(self):
+        # Define standard Chinese opening and closing quotation marks
+        self.ALL_POSSIBLE_OPENING_QUOTES = ['“', '‘', '『', '《', '〈']
+        self.ALL_POSSIBLE_CLOSING_QUOTES = ['”', '’', '』', '》', '〉']
+        
+        # Pre-compile regex for matching leading closing quotes for efficiency
+        self.leading_closing_quotes_pattern = re.compile(r'^([' + ''.join(re.escape(q) for q in self.ALL_POSSIBLE_CLOSING_QUOTES) + r'])+')
+        self.opening_quotes_tuple = tuple(self.ALL_POSSIBLE_OPENING_QUOTES)
+        self.closing_quotes_tuple = tuple(self.ALL_POSSIBLE_CLOSING_QUOTES)
+        self.extendable_closing_punctuation = ['\u201d', '\u2019', '\u300f', '\u300b', '\u3009', '\uff09', '\u3011', '\u300d', ']', '}']
+
     def segment_text(self, text: str, min_length: int = 10, delimiters: List[str] = None) -> List[str]:
         if delimiters is None or not delimiters:
             delimiters = ['。', '？', '！', '；', '\n', ' '] # Default, ensure space and newline are here if desired
@@ -115,68 +127,78 @@ class ChineseSegmenter:
         if not normalized_text.strip():
             return []
 
-        escaped_delimiters = [re.escape(d) for d in delimiters if d]
-        if not escaped_delimiters: # No valid delimiters, treat as one segment
-            if len(ChineseTextProcessor.remove_punctuation(normalized_text).strip()) >= min_length:
+        # --- Step 1: Enhanced Preliminary Segmentation with Extended Delimiters ---
+        raw_user_delimiters = [d for d in delimiters if d] # Filter out empty strings from user selection
+        if not raw_user_delimiters:
+            # No valid delimiters, treat as one segment if it meets min_length
+            # or if it's the only text available.
+            stripped_meaningful_text = ChineseTextProcessor.remove_punctuation(normalized_text).strip()
+            if len(stripped_meaningful_text) >= min_length:
                 return [normalized_text.strip()]
-            elif normalized_text.strip(): # Return if text exists, even if short, if it's the only thing
+            elif normalized_text.strip():
                  return [normalized_text.strip()]
             return []
 
-        split_pattern_str = r'(' + '|'.join(escaped_delimiters) + r')'
+        # Build the list of delimiter patterns to match
+        all_delimiter_patterns = []
+        # Add extended delimiters (base_delim + closing_punc)
+        for base_delim in raw_user_delimiters:
+            for closing_punc in self.extendable_closing_punctuation:
+                all_delimiter_patterns.append(re.escape(base_delim + closing_punc))
+        # Add base delimiters
+        for base_delim in raw_user_delimiters:
+            all_delimiter_patterns.append(re.escape(base_delim))
+        
+        # Sort by length descending to prioritize longer matches (e.g., '。\n[CLOSING_QUOTE]' before '。')
+        # Remove duplicates first to avoid issues if a base_delim is also an extended_delim part
+        unique_delimiter_patterns = sorted(list(set(all_delimiter_patterns)), key=len, reverse=True)
+        
+        if not unique_delimiter_patterns:
+            # This case should ideally not be reached if raw_user_delimiters was not empty,
+            # but as a fallback, handle as if no delimiters.
+            stripped_meaningful_text = ChineseTextProcessor.remove_punctuation(normalized_text).strip()
+            if len(stripped_meaningful_text) >= min_length:
+                return [normalized_text.strip()]
+            elif normalized_text.strip():
+                 return [normalized_text.strip()]
+            return []
+
+        split_pattern_str = r'(' + '|'.join(unique_delimiter_patterns) + r')'
         parts = re.split(split_pattern_str, normalized_text)
 
-        # --- Step 1: Aggressive Preliminary Segmentation ---
         preliminary_segments = []
-        current_phrase = ""
+        current_segment_text = ""
         for i, part_content in enumerate(parts):
-            if not part_content:
+            if not part_content: # Skip empty parts that can result from re.split
                 continue
             
-            is_user_defined_delimiter = (i % 2 == 1) and (part_content in delimiters)
-
-            current_phrase += part_content
-            if is_user_defined_delimiter:
-                if current_phrase.strip():
-                    preliminary_segments.append(current_phrase.strip())
-                current_phrase = ""
-        
-        if current_phrase.strip(): # Add any trailing phrase
-            preliminary_segments.append(current_phrase.strip())
-
-        if not preliminary_segments:
-            return []
+            is_text_part = (i % 2 == 0) # Text parts are at even indices in re.split with capturing group
             
-        # --- Step 1.5: Handle specific trailing punctuation like closing quotes ---
-        # This step tries to attach leading closing quotes of a segment to the end of the previous segment.
-        processed_prelim_segments = []
-        if preliminary_segments:
-            processed_prelim_segments.append(preliminary_segments[0]) # Add first segment as is
-            for i in range(1, len(preliminary_segments)):
-                current_seg = preliminary_segments[i]
-                prev_seg = processed_prelim_segments[-1]
-                
-                # Check for common closing quotes at the start of current_seg
-                # that might belong to prev_seg
-                # This is a heuristic. A more robust solution might involve parsing context.
-                closing_quotes_pattern = r'^(["\']+)'
-                leading_quotes_match = re.match(closing_quotes_pattern, current_seg)
-                
-                if leading_quotes_match:
-                    quotes = leading_quotes_match.group(0)
-                    # Check if prev_seg doesn't already end with similar or opening quotes that would make this illogical
-                    opening_quotes = ('"', '\'')
-                    if not prev_seg.endswith(tuple(delimiters) + opening_quotes):
-                        processed_prelim_segments[-1] = prev_seg + quotes # Attach to previous
-                        remaining_current_seg = current_seg[len(quotes):].strip()
-                        if remaining_current_seg:
-                            processed_prelim_segments.append(remaining_current_seg)
-                        # If current_seg was *only* quotes, it's now absorbed.
-                    else:
-                        processed_prelim_segments.append(current_seg) # Add as is, couldn't logically move
-                else:
-                    processed_prelim_segments.append(current_seg)
-            preliminary_segments = [s for s in processed_prelim_segments if s] # Clean empty
+            if is_text_part:
+                current_segment_text += part_content
+            else: # This is a delimiter part (part_content is the matched delimiter itself)
+                current_segment_text += part_content # Append the matched delimiter to the current text
+                if current_segment_text.strip(): # Ensure segment is not just whitespace
+                    preliminary_segments.append(current_segment_text.strip())
+                current_segment_text = "" # Reset for the next segment's text part
+        
+        # Add any remaining text if the input doesn't end with one of the defined delimiters
+        if current_segment_text.strip():
+            preliminary_segments.append(current_segment_text.strip())
+
+        if not preliminary_segments and normalized_text.strip(): # Handle case where splitting results in no segments but original text exists
+            # This might happen if text contains no delimiters or only delimiters at the very start/end that get stripped.
+            # If the text itself (after normalization) is meaningful and meets min_length criteria, treat it as one segment.
+            stripped_meaningful_text = ChineseTextProcessor.remove_punctuation(normalized_text).strip()
+            if len(stripped_meaningful_text) >= min_length:
+                return [normalized_text.strip()]
+            elif normalized_text.strip(): # Or if it's shorter but it's all there is
+                return [normalized_text.strip()]
+            return [] # Otherwise, no valid segments
+        elif not preliminary_segments: # Truly no segments and no original text
+            return []
+        
+        # Step 1.5 (handling leading quotes) is now removed as the new splitting logic should cover it.
 
 
         # --- Step 2: Merge Short Segments ---
@@ -187,38 +209,33 @@ class ChineseSegmenter:
             if not prelim_seg_str:
                 continue
 
-            # Calculate content length of this segment alone
-            segment_content_len = len(ChineseTextProcessor.remove_punctuation(
-                prelim_seg_str,
-                keep_space=(" " not in delimiters),
+            # Append prelim_seg_str to current_merged_segment
+            # Add a space if current_merged_segment is not empty and doesn't end with a delimiter/space,
+            # and prelim_seg_str doesn't start with one.
+            if current_merged_segment:
+                ends_with_sep_or_space = current_merged_segment.endswith(tuple(delimiters) + (" ", "\t"))
+                starts_with_sep_or_space = prelim_seg_str.startswith(tuple(delimiters) + (" ", "\t"))
+                if not ends_with_sep_or_space and not starts_with_sep_or_space:
+                    current_merged_segment += " "
+            current_merged_segment += prelim_seg_str
+
+            # Check content length of the current_merged_segment
+            content_len = len(ChineseTextProcessor.remove_punctuation(
+                current_merged_segment,
+                keep_space=(" " not in delimiters), # Only count actual text for length
                 keep_newline=("\n" not in delimiters)
             ).strip())
-            
-            # If current_merged_segment is empty or still below min_length, append this segment
-            if not current_merged_segment or len(ChineseTextProcessor.remove_punctuation(
-                current_merged_segment,
-                keep_space=(" " not in delimiters),
-                keep_newline=("\n" not in delimiters)
-            ).strip()) < min_length:
-                # Append prelim_seg_str to current_merged_segment with proper spacing
-                if current_merged_segment:
-                    ends_with_sep_or_space = current_merged_segment.endswith(tuple(delimiters) + (" ", "\t"))
-                    starts_with_sep_or_space = prelim_seg_str.startswith(tuple(delimiters) + (" ", "\t"))
-                    if not ends_with_sep_or_space and not starts_with_sep_or_space:
-                        current_merged_segment += " "
-                current_merged_segment += prelim_seg_str
-            else:
-                # Current segment is already at minimum length, so start a new segment
-                final_segments.append(current_merged_segment.strip())
-                current_merged_segment = prelim_seg_str
 
-            # Check if we're at the last segment
+            # Decide if current_merged_segment is complete
+            # It's complete if its content length is >= min_length OR it's the last piece of text.
             is_last_prelim = (i == len(preliminary_segments) - 1)
-            
-            # If this is the last segment and we have content in current_merged_segment, add it
-            if is_last_prelim and current_merged_segment:
-                # Only add as a new segment if it's not already added and has content
-                if not final_segments or final_segments[-1] != current_merged_segment.strip():
+
+            if content_len >= min_length:
+                final_segments.append(current_merged_segment.strip())
+                current_merged_segment = ""
+            elif is_last_prelim and current_merged_segment.strip(): 
+                # If it's the last piece and current_merged_segment has content (but < min_length)
+                if final_segments: # Append to the last valid segment
                     # Similar spacing logic for appending
                     ends_with_sep_or_space_final = final_segments[-1].endswith(tuple(delimiters) + (" ", "\t"))
                     starts_with_sep_or_space_current = current_merged_segment.startswith(tuple(delimiters) + (" ", "\t"))
@@ -514,32 +531,52 @@ class CharacterGridAligner:
 
 
 def initialize_session_state():
-    if 'uploaded_file_objects_info' not in st.session_state:
-        st.session_state.uploaded_file_objects_info = [] # [(file_obj, assigned_label, original_name), ...]
-    
+    # Existing states
     if 'processed_documents_data' not in st.session_state:
-        st.session_state.processed_documents_data = {} # {filename: {doc_label, full_raw_text, segments_data, segment_count}, ...}
-    
+        st.session_state.processed_documents_data = {}
+    if 'uploaded_file_objects_info' not in st.session_state:
+        st.session_state.uploaded_file_objects_info = []
     if 'alignment_table_cache' not in st.session_state:
-        st.session_state.alignment_table_cache = {} # {f"{filename_A}_{filename_B}_{threshold}": df, ...}
-    
+        st.session_state.alignment_table_cache = {}
+
+    default_delimiter_keys = [
+        "句号 (。)", "问号 (？)", "感叹号 (！)", "分号 (；)",
+        "换行符 (↵)", "空格 (␣)"
+    ]
     if 'selected_delimiters_names' not in st.session_state:
-        # Default delimiters
-        st.session_state.selected_delimiters_names = ["句号 (。)", "问号 (？)", "感叹号 (！)", "分号 (；)", "换行符 (↵)"]
-        st.session_state.active_delimiters_chars = [ALL_POSSIBLE_DELIMITERS[name] for name in st.session_state.selected_delimiters_names]
+        st.session_state.selected_delimiters_names = default_delimiter_keys
+
+    if 'active_delimiters_chars' not in st.session_state:
+        st.session_state.active_delimiters_chars = [
+            ALL_POSSIBLE_DELIMITERS[name] for name in st.session_state.selected_delimiters_names
+            if name in ALL_POSSIBLE_DELIMITERS
+        ]
+
+    # New state variables for refactored workflow
+    if 'doc_1_to_compare_label' not in st.session_state:
+        st.session_state.doc_1_to_compare_label = None
+    if 'doc_2_to_compare_label' not in st.session_state:
+        st.session_state.doc_2_to_compare_label = None
+    if 'all_docs_processed_at_least_once' not in st.session_state: # Tracks if processing has run for the *selected pair*
+        st.session_state.all_docs_processed_at_least_once = False
     
-    # Track parameter changes
+    # Processing flags
+    # Note: 'all_docs_processed_at_least_once' is already initialized above (lines 561-562)
+    if 'processing_underway' not in st.session_state: 
+        st.session_state.processing_underway = False
+    if 'process_button_triggered' not in st.session_state:
+        st.session_state.process_button_triggered = False
+    
+    # For parameter change detection - these are updated *before* processing is triggered.
+    # Defaults should match the actual defaults of the sidebar widgets.
     if 'last_min_segment_len' not in st.session_state:
-        st.session_state.last_min_segment_len = 9
-    
+        st.session_state.last_min_segment_len = 10 # Default from slider (line ~827)
+    if 'last_active_delimiters_chars' not in st.session_state:
+        st.session_state.last_active_delimiters_chars = list(st.session_state.active_delimiters_chars)
     if 'last_similarity_thresh' not in st.session_state:
-        st.session_state.last_similarity_thresh = 0.3
-        
+        st.session_state.last_similarity_thresh = 0.3 # Default from slider (line ~848)
     if 'last_chars_per_line_grid' not in st.session_state:
-        st.session_state.last_chars_per_line_grid = 30
-        
-    if 'parameters_changed' not in st.session_state:
-        st.session_state.parameters_changed = False
+        st.session_state.last_chars_per_line_grid = 30 # Default from slider (line ~851)
 
 
 ALL_POSSIBLE_DELIMITERS = {
@@ -593,7 +630,7 @@ def main():
             
             # --- Improved Label Assignment Logic ---
             num_uploaded_docs = len(st.session_state.uploaded_file_objects_info)
-            possible_labels_for_dropdown = DOC_LABELS_AVAILABLE[:num_uploaded_docs] # e.g., ['A', 'B'] if 2 docs
+            possible_labels_for_dropdown = DOC_LABELS_AVAILABLE[:MAX_DOCS] # Allow choosing from all potential labels A-E
 
             try:
                 current_label_idx_in_dropdown = possible_labels_for_dropdown.index(current_assigned_label)
@@ -640,6 +677,44 @@ def main():
                     )
                 
                 # After changing labels, re-sort the list by label to maintain A, B, C... order visually (optional but good UX)
+                # --- Update dependent session state variables ---
+                old_label_of_doc_being_changed = current_assigned_label
+                new_label_of_doc_being_changed = new_label_selected
+
+                # 1. Update selected comparison labels
+                if st.session_state.doc_1_to_compare_label == old_label_of_doc_being_changed:
+                    st.session_state.doc_1_to_compare_label = new_label_of_doc_being_changed
+                elif other_doc_index_with_new_label != -1 and st.session_state.doc_1_to_compare_label == new_label_of_doc_being_changed:
+                    # The doc selected for comparison 1 was the 'other' doc that got swapped
+                    st.session_state.doc_1_to_compare_label = old_label_of_doc_being_changed # It now has this label
+                
+                if st.session_state.doc_2_to_compare_label == old_label_of_doc_being_changed:
+                    st.session_state.doc_2_to_compare_label = new_label_of_doc_being_changed
+                elif other_doc_index_with_new_label != -1 and st.session_state.doc_2_to_compare_label == new_label_of_doc_being_changed:
+                    # The doc selected for comparison 2 was the 'other' doc that got swapped
+                    st.session_state.doc_2_to_compare_label = old_label_of_doc_being_changed # It now has this label
+
+                # 2. Update processed_documents_data keys
+                processed_data_temp_store = None
+                if old_label_of_doc_being_changed in st.session_state.processed_documents_data:
+                    processed_data_temp_store = st.session_state.processed_documents_data.pop(old_label_of_doc_being_changed)
+                
+                if other_doc_index_with_new_label != -1: # If a swap happened
+                    # The 'other' doc (which initially had new_label_of_doc_being_changed) now has old_label_of_doc_being_changed
+                    if new_label_of_doc_being_changed in st.session_state.processed_documents_data:
+                        data_of_other_doc = st.session_state.processed_documents_data.pop(new_label_of_doc_being_changed)
+                        st.session_state.processed_documents_data[old_label_of_doc_being_changed] = data_of_other_doc
+                
+                if processed_data_temp_store:
+                    st.session_state.processed_documents_data[new_label_of_doc_being_changed] = processed_data_temp_store
+
+                # 3. Clear alignment_table_cache (simplest approach for now)
+                #    A more sophisticated update would involve iterating and reconstructing keys.
+                if st.session_state.alignment_table_cache: # Only clear if not empty
+                    st.session_state.alignment_table_cache = {}
+                    # Since caches are cleared, reprocessing might be needed if these docs were part of comparison
+                    st.session_state.all_docs_processed_at_least_once = False 
+
                 st.session_state.uploaded_file_objects_info.sort(key=lambda x: x[1])
                 st.rerun() # Rerun to reflect changes in UI and ensure consistency
 
@@ -683,303 +758,361 @@ def main():
         # Keeping it for safety to ensure order after all selectboxes are processed in a run without changes.
         # st.session_state.uploaded_file_objects_info.sort(key=lambda x: x[1]) # Sort by assigned label (A, B, C...)
         
-        # 在文件管理部分末尾添加处理按钮，确保st.session_state.uploaded_file_objects_info的状态是最新的
+        # --- Sidebar: Select Documents for Comparison ---
+        st.sidebar.header("📊 选择对比文档")
+        uploaded_doc_labels = [info[1] for info in st.session_state.uploaded_file_objects_info]
+        uploaded_doc_display_names_map = {info[1]: info[2] for info in st.session_state.uploaded_file_objects_info}
+
+        if len(uploaded_doc_labels) < 2:
+            st.sidebar.info("请至少上传两个文档以进行对比。")
+            # Ensure comparison labels are reset if not enough docs
+            st.session_state.doc_1_to_compare_label = None
+            st.session_state.doc_2_to_compare_label = None
+            st.session_state.all_docs_processed_at_least_once = False
+        else:
+            # Default selection for doc 1
+            default_idx1 = 0
+            if st.session_state.doc_1_to_compare_label and st.session_state.doc_1_to_compare_label in uploaded_doc_labels:
+                default_idx1 = uploaded_doc_labels.index(st.session_state.doc_1_to_compare_label)
+            elif uploaded_doc_labels:
+                 st.session_state.doc_1_to_compare_label = uploaded_doc_labels[0]
+            
+            new_doc_1_label = st.sidebar.selectbox(
+                "选择文档 1 进行对比:",
+                options=uploaded_doc_labels,
+                index=default_idx1,
+                format_func=lambda x: f"{x} ({uploaded_doc_display_names_map.get(x, '')})",
+                key="sidebar_sel_doc_1"
+            )
+            if new_doc_1_label != st.session_state.doc_1_to_compare_label:
+                st.session_state.doc_1_to_compare_label = new_doc_1_label
+                st.session_state.all_docs_processed_at_least_once = False # Reset flag on change
+                st.rerun() # Rerun to update doc2 options and defaults
+
+            # Default selection for doc 2, ensuring it's different from doc 1
+            available_for_doc2 = [l for l in uploaded_doc_labels if l != st.session_state.doc_1_to_compare_label]
+            default_idx2 = 0
+            if not available_for_doc2:
+                 st.session_state.doc_2_to_compare_label = None # No valid option for doc2
+            elif st.session_state.doc_2_to_compare_label and st.session_state.doc_2_to_compare_label in available_for_doc2:
+                default_idx2 = available_for_doc2.index(st.session_state.doc_2_to_compare_label)
+            elif available_for_doc2: # If doc_2_to_compare_label was None or became invalid
+                st.session_state.doc_2_to_compare_label = available_for_doc2[0]
+                default_idx2 = 0
+            
+            if available_for_doc2:
+                new_doc_2_label = st.sidebar.selectbox(
+                    "选择文档 2 进行对比:",
+                    options=available_for_doc2,
+                    index=default_idx2,
+                    format_func=lambda x: f"{x} ({uploaded_doc_display_names_map.get(x, '')})",
+                    key="sidebar_sel_doc_2"
+                )
+                if new_doc_2_label != st.session_state.doc_2_to_compare_label:
+                    st.session_state.doc_2_to_compare_label = new_doc_2_label
+                    st.session_state.all_docs_processed_at_least_once = False # Reset flag on change
+                    st.rerun()
+            else:
+                st.sidebar.warning("没有其他文档可供选择作为文档2。")
+                st.session_state.doc_2_to_compare_label = None
+
+        can_process = (st.session_state.doc_1_to_compare_label is not None and 
+                       st.session_state.doc_2_to_compare_label is not None and 
+                       st.session_state.doc_1_to_compare_label != st.session_state.doc_2_to_compare_label and 
+                       len(st.session_state.uploaded_file_objects_info) >= 2)
+
         process_all_button = st.sidebar.button("🚀 处理所有已上传文档", type="primary", use_container_width=True,
-                                             disabled=not st.session_state.uploaded_file_objects_info)
+                                             disabled=not can_process)
 
     # --- Sidebar: Processing Parameters ---
     st.sidebar.header("⚙️ 处理参数")
-    min_segment_len = st.sidebar.slider("最小段落长度 (有效字符)", 3, 50, st.session_state.last_min_segment_len, 1, help="段落分割后，每个段落最少包含的有效字符数（不计标点）。")
+    st.sidebar.markdown("<h4 style='font-size: 1em; margin-bottom: 0.1em;'>最小段落长度 (有效字符)</h4>", unsafe_allow_html=True)
+    min_segment_len = st.sidebar.slider("最小段落长度 (有效字符)", 3, 50, 10, 1, help="段落分割后，每个段落最少包含的有效字符数（不计标点）。", label_visibility="collapsed")
     
-    st.sidebar.subheader("段落分割符选择")
+    st.sidebar.markdown("<h4 style='font-size: 1em; margin-bottom: 0.1em;'>段落分割符选择</h4>", unsafe_allow_html=True)
     temp_selected_delimiters_names = []
     for name, char_val in ALL_POSSIBLE_DELIMITERS.items():
-        if st.sidebar.checkbox(name, value=(name in st.session_state.selected_delimiters_names), key=f"delim_cb_{name}"):
+        col1, col2 = st.sidebar.columns([1, 8]) # Adjust column ratios as needed
+        with col1:
+            # Use a unique key for the checkbox, label_visibility collapsed hides the actual label string
+            is_checked = st.checkbox("", value=(name in st.session_state.selected_delimiters_names), key=f"delim_cb_{name}", label_visibility="collapsed")
+        with col2:
+            # Display the styled name using markdown. Adjust vertical-align if needed.
+            st.markdown(f"<span style='font-size: 0.85em; display: inline-block; margin-top: 5px;'>{name}</span>", unsafe_allow_html=True)
+        
+        if is_checked:
             temp_selected_delimiters_names.append(name)
     
     if temp_selected_delimiters_names != st.session_state.selected_delimiters_names:
         st.session_state.selected_delimiters_names = temp_selected_delimiters_names
         st.session_state.active_delimiters_chars = [ALL_POSSIBLE_DELIMITERS[name] for name in st.session_state.selected_delimiters_names if name in ALL_POSSIBLE_DELIMITERS]
-        st.rerun() # Rerun if delimiter selection changed
 
-    similarity_thresh = st.sidebar.slider("相似度阈值 (段落匹配)", 0.1, 0.99, st.session_state.last_similarity_thresh, 0.01)
-    chars_per_line_grid = st.sidebar.slider("网格每行字符数 (字符网格)", 10, 80, st.session_state.last_chars_per_line_grid, 1)
-
-    # Check for parameter changes
-    if min_segment_len != st.session_state.last_min_segment_len:
-        st.session_state.parameters_changed = True
-        st.session_state.last_min_segment_len = min_segment_len
+    st.sidebar.markdown("<h4 style='font-size: 1em; margin-bottom: 0.1em;'>相似度阈值 (段落匹配)</h4>", unsafe_allow_html=True)
+    similarity_thresh = st.sidebar.slider("相似度阈值", 0.1, 0.99, 0.3, 0.01, label_visibility="collapsed")
     
+    st.sidebar.markdown("<h4 style='font-size: 1em; margin-bottom: 0.1em;'>网格每行字符数 (字符网格)</h4>", unsafe_allow_html=True)
+    chars_per_line_grid = st.sidebar.slider("网格每行字符数", 10, 80, 30, 1, label_visibility="collapsed")
+
+    # --- Check for Explicit Button Trigger for Processing ---
+    if st.session_state.get('process_button_triggered', False):
+        st.session_state.process_button_triggered = False # Consume the flag
+        # Parameters should have been set to last_... when the button was clicked before rerun
+        st.session_state.processing_underway = True
+        st.session_state.processed_documents_data = {}
+        st.session_state.alignment_table_cache = {}
+        st.session_state.all_docs_processed_at_least_once = False
+        # No rerun here, allow script to flow into processing block
+
     # --- Main Processing Logic ---
-    # 检查process_all_button是否存在于会话状态中，这样可以解决作用域问题
-    if 'process_button_clicked' not in st.session_state:
-        st.session_state.process_button_clicked = False
-        
-    # 如果按钮被点击或参数改变，更新会话状态
-    if ('process_all_button' in locals() and process_all_button) or st.session_state.parameters_changed:
-        st.session_state.process_button_clicked = True
-        st.session_state.parameters_changed = False
-        
-    # 使用会话状态中的值来确定是否处理文档
-    if st.session_state.process_button_clicked:
-        if not st.session_state.uploaded_file_objects_info:
-            st.error("请先上传文档后再进行处理。")
+    # Initialize session state variables if they don't exist
+    if 'processing_underway' not in st.session_state: # To show spinner status
+        st.session_state.processing_underway = False
+
+    # Parameter change detection
+    params_changed = (
+        min_segment_len != st.session_state.get('last_min_segment_len') or
+        set(st.session_state.active_delimiters_chars) != set(st.session_state.get('last_active_delimiters_chars', [])) or
+        similarity_thresh != st.session_state.get('last_similarity_thresh') or
+        chars_per_line_grid != st.session_state.get('last_chars_per_line_grid')
+    )
+
+    if params_changed and not st.session_state.processing_underway:
+        # Only trigger processing due to param change if not already triggered by button for these params
+        st.session_state.all_docs_processed_at_least_once = False # Indicate re-processing is needed for current view
+        if st.session_state.uploaded_file_objects_info and \
+           st.session_state.doc_1_to_compare_label and st.session_state.doc_2_to_compare_label and \
+           st.session_state.doc_1_to_compare_label != st.session_state.doc_2_to_compare_label:
+            # If a valid pair is selected, and params changed, set to process
+            st.session_state.processing_underway = True 
+            st.session_state.processed_documents_data = {} # Clear old processed data
+            st.session_state.alignment_table_cache = {}   # Clear alignment cache
+            # Update last_... params HERE to prevent rerun loop and reflect current settings for processing
+            st.session_state.last_min_segment_len = min_segment_len
+            st.session_state.last_active_delimiters_chars = list(st.session_state.active_delimiters_chars) # Ensure a copy
+            st.session_state.last_similarity_thresh = similarity_thresh
+            st.session_state.last_chars_per_line_grid = chars_per_line_grid
+            st.rerun() # Rerun to trigger processing
+
+    # If "Process All" button is clicked by the user
+    if 'process_all_button' in locals() and process_all_button: # process_all_button is defined in sidebar
+        if st.session_state.doc_1_to_compare_label and st.session_state.doc_2_to_compare_label and \
+           st.session_state.doc_1_to_compare_label != st.session_state.doc_2_to_compare_label:
+            st.session_state.process_button_triggered = True # Set the trigger flag
+            # Update last_... params HERE to capture the settings at the moment of button click
+            st.session_state.last_min_segment_len = min_segment_len
+            st.session_state.last_active_delimiters_chars = list(st.session_state.active_delimiters_chars) # Ensure a copy
+            st.session_state.last_similarity_thresh = similarity_thresh
+            st.session_state.last_chars_per_line_grid = chars_per_line_grid
+            # No need to clear caches or set processing_underway here; the new block will handle it after rerun
+            st.rerun() # Rerun to activate the trigger
         else:
-            with st.spinner("⏳ 正在处理所有文档..."):
-                text_processor = ChineseTextProcessor()
-                segmenter = ChineseSegmenter()
-                
-                # Clear previous processed data to ensure fresh processing
-                st.session_state.processed_documents_data = {}
-                st.session_state.alignment_table_cache = {} # Clear pairwise alignment cache
+            st.sidebar.error("请先在侧边栏选择两个不同的文档进行对比。")
 
-                for file_obj, assigned_label, original_name in st.session_state.uploaded_file_objects_info:
-                    st.write(f"处理文档: {original_name} (标签: {assigned_label})...") # Progress update
-                    raw_text = text_processor.extract_text_from_file(file_obj)
-                    if not raw_text:
-                        st.warning(f"文档 {original_name} 内容为空或读取失败。")
-                        continue
+    # --- Main Content Display --- 
+    # This entire block replaces the old main content display logic from original line 800 to 1060
 
-                    segments = segmenter.segment_text(raw_text, min_segment_len, st.session_state.active_delimiters_chars)
-                    segments_with_ids = segmenter.add_segment_ids(segments, assigned_label)
+    # 1. Handle initial states: no uploads, or docs not selected for comparison
+    if not st.session_state.uploaded_file_objects_info:
+        st.info("👈 请在侧边栏上传文档以开始。")
+    elif not st.session_state.doc_1_to_compare_label or not st.session_state.doc_2_to_compare_label:
+        st.info("👈 请在侧边栏选择两个文档进行对比分析。")
+    elif st.session_state.doc_1_to_compare_label == st.session_state.doc_2_to_compare_label:
+        st.warning("👈 请在侧边栏选择两个不同的文档进行对比。")
+    
+    # 2. Handle processing state or if processing is needed
+    elif st.session_state.processing_underway:
+        # This spinner will show if processing_underway was set true before a rerun
+        with st.spinner("正在处理文档，请稍候..."):
+            # The actual processing logic is now placed here to ensure it runs within the spinner context
+            # and directly updates state before the next display check.
+            # No need to check for processing trigger here, as processing_underway is already True
+            # Use current parameter values from the sidebar for processing
+            current_min_segment_len = min_segment_len 
+            current_active_delimiters_chars = st.session_state.active_delimiters_chars
+            current_similarity_thresh = similarity_thresh 
+            current_chars_per_line_grid = chars_per_line_grid
+
+            for file_obj, assigned_label, original_name in st.session_state.uploaded_file_objects_info:
+                try:
+                    file_obj.seek(0) # Reset read pointer for re-processing
+                    raw_text = ChineseTextProcessor.extract_text_from_file(file_obj)
+                    normalized_text = ChineseTextProcessor.normalize_text(raw_text)
+                    segmenter = ChineseSegmenter()
+                    segments_text = segmenter.segment_text(normalized_text, min_length=current_min_segment_len, delimiters=current_active_delimiters_chars)
+                    segments_data_with_ids = segmenter.add_segment_ids(segments_text, doc_id_prefix=assigned_label)
                     
-                    st.session_state.processed_documents_data[original_name] = {
+                    st.session_state.processed_documents_data[assigned_label] = {
                         'doc_label': assigned_label,
                         'filename': original_name,
-                        'full_raw_text': raw_text, # Store full raw text
-                        'segments_data': segments_with_ids,
-                        'segment_count': len(segments_with_ids)
+                        'full_raw_text': raw_text,
+                        'full_normalized_text': normalized_text,
+                        'segments_text': segments_text,
+                        'segments_data': segments_data_with_ids,
+                        'segment_count': len(segments_text)
                     }
-                st.success("🎉 所有文档处理完成！")
-                # 重置处理按钮状态，这样用户可以再次点击处理按钮
-                st.session_state.process_button_clicked = False
-                st.rerun() # Rerun to update UI with processed data
+                except Exception as e:
+                    st.error(f"处理文档 {original_name} (Label {assigned_label}) 时出错: {e}")
+            
+            # Processing finished successfully
+            st.session_state.processing_underway = False 
+            st.session_state.all_docs_processed_at_least_once = True # Mark that processing for this selection is done
+            
+            # Update last parameters *after* successful processing
+            st.session_state.last_min_segment_len = current_min_segment_len
+            st.session_state.last_active_delimiters_chars = list(current_active_delimiters_chars)
+            st.session_state.last_similarity_thresh = current_similarity_thresh
+            st.session_state.last_chars_per_line_grid = current_chars_per_line_grid
+            
+            st.rerun() # Rerun to update display with processed data
 
-    # --- Display Area ---
-    if st.session_state.processed_documents_data:
-        processed_doc_infos = list(st.session_state.processed_documents_data.values())
-        processed_doc_infos.sort(key=lambda x: x['doc_label']) # Sort by A, B, C...
+    # 3. Display comparison results if documents are selected and processed
+    elif st.session_state.doc_1_to_compare_label and st.session_state.doc_2_to_compare_label and \
+         st.session_state.all_docs_processed_at_least_once:
         
-        doc_display_names_map = {info['doc_label']: info['filename'] for info in processed_doc_infos}
-        available_doc_labels_for_selection = [info['doc_label'] for info in processed_doc_infos]
+        selected_doc_label_1 = st.session_state.doc_1_to_compare_label
+        selected_doc_label_2 = st.session_state.doc_2_to_compare_label
 
-        if len(available_doc_labels_for_selection) < 2:
-            st.info("请处理至少两个文档以进行对比分析。")
-        else:
-            st.markdown("---")
-            st.subheader("🔬 选择文档进行对比分析")
-            col_sel1, col_sel2 = st.columns(2)
-            selected_doc_label_1 = col_sel1.selectbox(
-                "选择文档 1:", available_doc_labels_for_selection, index=0,
-                format_func=lambda x: f"{x} ({doc_display_names_map.get(x, '')})", key="sel_doc_1"
-            )
-            # Ensure Doc 2 default is different from Doc 1
-            doc2_default_idx = 1 if len(available_doc_labels_for_selection) > 1 else 0
-            if available_doc_labels_for_selection[doc2_default_idx] == selected_doc_label_1 and len(available_doc_labels_for_selection) > 1:
-                 doc2_default_idx = 0 # Should not happen if list > 1 and default is 1. Pick 0 if it's the only other option.
+        doc_data_1 = st.session_state.processed_documents_data.get(selected_doc_label_1)
+        doc_data_2 = st.session_state.processed_documents_data.get(selected_doc_label_2)
 
-            selected_doc_label_2 = col_sel2.selectbox(
-                "选择文档 2:", available_doc_labels_for_selection, index=doc2_default_idx,
-                format_func=lambda x: f"{x} ({doc_display_names_map.get(x, '')})", key="sel_doc_2"
-            )
+        if doc_data_1 and doc_data_2:
+            # --- Tabs for Alignment Table, Grid, Stats (Pairwise) ---
+            tab_align, tab_grid, tab_stats = st.tabs(["📜 对齐表格视图", "⠿ 字符网格对比", "📈 统计图表"])
 
-            if selected_doc_label_1 == selected_doc_label_2:
-                st.warning("请选择两个不同的文档进行对比。")
-            else:
-                # Find original filenames for these labels to fetch data
-                doc_data_1 = next(item for item in processed_doc_infos if item['doc_label'] == selected_doc_label_1)
-                doc_data_2 = next(item for item in processed_doc_infos if item['doc_label'] == selected_doc_label_2)
-
-                # --- Alignment Table and Stats (Pairwise) ---
-                tab_align, tab_grid, tab_stats = st.tabs(["📜 对齐表格视图", "⠿ 字符网格对比", "📈 统计图表"])
-
-                with tab_align:
-                    st.markdown(f"#### 段落对齐: **{doc_data_1['filename']} ({selected_doc_label_1})** vs **{doc_data_2['filename']} ({selected_doc_label_2})**")
-                    
-                    cache_key_align = tuple(sorted((doc_data_1['filename'], doc_data_2['filename']))) + (similarity_thresh,)
-                    if cache_key_align not in st.session_state.alignment_table_cache:
-                        with st.spinner(f"计算 {selected_doc_label_1} 和 {selected_doc_label_2} 的段落对齐..."):
-                            matcher_align = ChineseSimilarityMatcher()
-                            st.session_state.alignment_table_cache[cache_key_align] = matcher_align.find_best_matches(
-                                doc_data_1['segments_data'], doc_data_2['segments_data'], similarity_thresh
-                            )
-                    
-                    current_alignment_table = st.session_state.alignment_table_cache[cache_key_align]
-                    matched_count_pair = sum(1 for item in current_alignment_table if item.get('matched', False))
-                    st.info(f"找到 {matched_count_pair} 对相似段落 (阈值 > {similarity_thresh:.2f})。内容预览限100字符。")
-
-                    df_data_align = []
-                    sorted_alignment_for_df = sorted(current_alignment_table, key=lambda x: (x['a_index'] if x['a_index'] != -1 else float('inf'), x['b_index'] if x['b_index'] != -1 else float('inf')))
-                    for item in sorted_alignment_for_df:
-                        row = {}
-                        doc1_label_dynamic = selected_doc_label_1 # More dynamic label
-                        doc2_label_dynamic = selected_doc_label_2
-                        if item['segment_a']:
-                            row[f'{doc1_label_dynamic}段落ID'] = item['segment_a']['id']
-                            row[f'{doc1_label_dynamic}段落内容'] = item['segment_a']['text'][:100] + ('...' if len(item['segment_a']['text']) > 100 else '')
-                        else:
-                            row[f'{doc1_label_dynamic}段落ID'] = ''
-                            row[f'{doc1_label_dynamic}段落内容'] = ''
-                        
-                        if item['segment_b']:
-                            row[f'{doc2_label_dynamic}段落ID'] = item['segment_b']['id']
-                            row[f'{doc2_label_dynamic}段落内容'] = item['segment_b']['text'][:100] + ('...' if len(item['segment_b']['text']) > 100 else '')
-                        else:
-                            row[f'{doc2_label_dynamic}段落ID'] = ''
-                            row[f'{doc2_label_dynamic}段落内容'] = ''
-                        row['相似度'] = f"{item['similarity']:.3f}" if item['matched'] else "-"
-                        df_data_align.append(row)
-                    
-                    df_display_align = pd.DataFrame(df_data_align)
-                    
-                    # 将相似度列移到第一列
-                    if not df_display_align.empty and '相似度' in df_display_align.columns:
-                        cols_order = ['相似度'] + [col for col in df_display_align.columns if col != '相似度']
-                        df_display_align = df_display_align[cols_order]
-                    
-                    st.dataframe(df_display_align, use_container_width=True, height=500)
-                    
-                    # CSV下载按钮
-                    csv_export_align = df_display_align.to_csv(index=False, encoding='utf-8-sig')
-                    st.download_button(f"📥 下载 {selected_doc_label_1}-{selected_doc_label_2} 对齐表 (CSV)", 
-                                      csv_export_align, 
-                                      f"alignment_{selected_doc_label_1}_{selected_doc_label_2}.csv", 
-                                      "text/csv")
-                    
-                    # Excel下载按钮
-                    if not df_display_align.empty:
-                        output_xlsx = io.BytesIO()
-                        with pd.ExcelWriter(output_xlsx, engine='openpyxl') as writer:
-                            df_display_align.to_excel(writer, index=False, sheet_name='Alignment')
-                        excel_data = output_xlsx.getvalue()
-                        st.download_button(
-                            f"📥 下载 {selected_doc_label_1}-{selected_doc_label_2} 对齐表 (XLSX)",
-                            data=excel_data,
-                            file_name=f"alignment_{selected_doc_label_1}_{selected_doc_label_2}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key="xlsx_download"
-                        )
-
-                with tab_grid:
-                    st.markdown(f"#### 字符网格: **{doc_data_1['filename']} ({selected_doc_label_1})** vs **{doc_data_2['filename']} ({selected_doc_label_2})**")
-                    ignore_punc_grid_display = st.checkbox("比对和显示时忽略所有标点符号", value=False, key="cb_ignore_punc_grid")
-
-                    text_A_for_grid = doc_data_1['full_raw_text']
-                    text_B_for_grid = doc_data_2['full_raw_text']
-
-                    with st.spinner("生成字符网格..."):
-                        aligned_A_grid_chars, aligned_B_grid_chars = CharacterGridAligner.align_full_texts_for_grid(
-                            text_A_for_grid, text_B_for_grid, ignore_punc_grid_display
-                        )
-                    
-                    if aligned_A_grid_chars or aligned_B_grid_chars:
-                        grid_html_content = CharacterGridAligner.create_grid_html_for_full_docs(
-                            selected_doc_label_1, selected_doc_label_2,
-                            aligned_A_grid_chars, aligned_B_grid_chars,
-                            chars_per_line_grid
-                        )
-                        st.components.v1.html(grid_html_content, height=700, scrolling=True)
-                        st.download_button(f"📥 下载 {selected_doc_label_1}-{selected_doc_label_2} 网格 (HTML)", grid_html_content, f"grid_{selected_doc_label_1}_{selected_doc_label_2}.html", "text/html")
-                    else:
-                        st.info("选择的文档内容为空或处理后为空，无法生成字符网格。")
+            with tab_align:
+                st.markdown(f"#### 段落对齐: **{doc_data_1['filename']} ({selected_doc_label_1})** vs **{doc_data_2['filename']} ({selected_doc_label_2})**")
+                cache_key_align = tuple(sorted((selected_doc_label_1, selected_doc_label_2))) + \
+                                  (similarity_thresh, min_segment_len, tuple(sorted(st.session_state.active_delimiters_chars)))
                 
-                with tab_stats:
-                    st.markdown(f"#### 文档对齐分布图: **{doc_data_1['filename']} ({selected_doc_label_1})** vs **{doc_data_2['filename']} ({selected_doc_label_2})**")
-                    current_alignment_table_for_dist = st.session_state.alignment_table_cache.get(cache_key_align, [])
+                if cache_key_align not in st.session_state.alignment_table_cache:
+                    with st.spinner(f"计算 {selected_doc_label_1} 和 {selected_doc_label_2} 的段落对齐..."):
+                        matcher_align = ChineseSimilarityMatcher()
+                        st.session_state.alignment_table_cache[cache_key_align] = matcher_align.find_best_matches(
+                            doc_data_1['segments_data'], doc_data_2['segments_data'], similarity_thresh # Use current similarity_thresh from sidebar
+                        )
+                
+                current_alignment_table = st.session_state.alignment_table_cache[cache_key_align]
+                matched_count_pair = sum(1 for item in current_alignment_table if item.get('matched', False))
+                st.info(f"找到 {matched_count_pair} 对相似段落 (阈值 > {similarity_thresh:.2f})。内容预览限100字符。")
 
-                    if not current_alignment_table_for_dist:
-                        st.info("请先在“对齐表格视图”标签页生成对齐数据。")
+                df_data_align = []
+                sorted_alignment_for_df = sorted(current_alignment_table, key=lambda x: (x['a_index'] if x['a_index'] != -1 else float('inf'), x['b_index'] if x['b_index'] != -1 else float('inf')))
+
+                for item in sorted_alignment_for_df:
+                    row = {}
+                    if item['segment_a']:
+                        row[f'{selected_doc_label_1}段落ID'] = item['segment_a']['id']
+                        row[f'{selected_doc_label_1}段落内容'] = item['segment_a']['text'][:100] + ('...' if len(item['segment_a']['text']) > 100 else '')
                     else:
-                        plot_data = []
-                        max_index_a = 0
-                        max_index_b = 0
+                        row[f'{selected_doc_label_1}段落ID'] = ''
+                        row[f'{selected_doc_label_1}段落内容'] = ''
+                    
+                    if item['segment_b']:
+                        row[f'{selected_doc_label_2}段落ID'] = item['segment_b']['id']
+                        row[f'{selected_doc_label_2}段落内容'] = item['segment_b']['text'][:100] + ('...' if len(item['segment_b']['text']) > 100 else '')
+                    else:
+                        row[f'{selected_doc_label_2}段落ID'] = ''
+                        row[f'{selected_doc_label_2}段落内容'] = ''
+                    row['相似度'] = f"{item['similarity']:.3f}" if item['matched'] else "-"
+                    df_data_align.append(row)
+                
+                df_display_align = pd.DataFrame(df_data_align)
+                if not df_display_align.empty and '相似度' in df_display_align.columns:
+                    cols_order = ['相似度'] + [col for col in df_display_align.columns if col != '相似度']
+                    df_display_align = df_display_align[cols_order]
+                
+                st.dataframe(df_display_align, use_container_width=True, height=500)
+                
+                # Use more unique keys for download buttons to avoid conflicts after reruns
+                csv_export_align = df_display_align.to_csv(index=False, encoding='utf-8-sig')
+                st.download_button(f"📥 下载 {selected_doc_label_1}-{selected_doc_label_2} 对齐表 (CSV)", csv_export_align, f"alignment_{selected_doc_label_1}_{selected_doc_label_2}.csv", "text/csv", key=f"csv_dl_{selected_doc_label_1}_{selected_doc_label_2}_{int(time.time())}")
+                
+                if not df_display_align.empty:
+                    output_xlsx = io.BytesIO()
+                    with pd.ExcelWriter(output_xlsx, engine='openpyxl') as writer:
+                        df_display_align.to_excel(writer, index=False, sheet_name='Alignment')
+                    excel_data = output_xlsx.getvalue()
+                    st.download_button(f"📥 下载 {selected_doc_label_1}-{selected_doc_label_2} 对齐表 (XLSX)", data=excel_data, file_name=f"alignment_{selected_doc_label_1}_{selected_doc_label_2}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"xlsx_dl_{selected_doc_label_1}_{selected_doc_label_2}_{int(time.time())}")
 
-                        for item in current_alignment_table_for_dist:
-                            if item.get('matched', False) and item['segment_a'] and item['segment_b']:
-                                plot_data.append({
-                                    'doc_A_index': item['segment_a']['index'],
-                                    'doc_B_index': item['segment_b']['index'],
-                                    'similarity': item['similarity'],
-                                    'type': 'Matched Pair',
-                                    'text_A': item['segment_a']['text'][:30] + "...",
-                                    'text_B': item['segment_b']['text'][:30] + "...",
-                                    'id_A': item['segment_a']['id'],
-                                    'id_B': item['segment_b']['id'],
-                                })
-                                max_index_a = max(max_index_a, item['segment_a']['index'])
-                                max_index_b = max(max_index_b, item['segment_b']['index'])
-                            elif item['segment_a'] and not item['segment_b']: # A only
-                                plot_data.append({
-                                    'doc_A_index': item['segment_a']['index'],
-                                    'doc_B_index': -5, # Placeholder for y-axis (or use a secondary axis/plot)
-                                    'similarity': 0,
-                                    'type': f'{selected_doc_label_1} Only',
-                                    'text_A': item['segment_a']['text'][:30] + "...",
-                                    'text_B': "",
-                                    'id_A': item['segment_a']['id'],
-                                    'id_B': "",
-                                })
-                                max_index_a = max(max_index_a, item['segment_a']['index'])
-                            elif item['segment_b'] and not item['segment_a']: # B only
-                                plot_data.append({
-                                    'doc_A_index': -5, # Placeholder for x-axis
-                                    'doc_B_index': item['segment_b']['index'],
-                                    'similarity': 0,
-                                    'type': f'{selected_doc_label_2} Only',
-                                    'text_A': "",
-                                    'text_B': item['segment_b']['text'][:30] + "...",
-                                    'id_A': "",
-                                    'id_B': item['segment_b']['id'],
-                                })
-                                max_index_b = max(max_index_b, item['segment_b']['index'])
+            with tab_grid:
+                st.markdown(f"#### 字符网格: **{doc_data_1['filename']} ({selected_doc_label_1})** vs **{doc_data_2['filename']} ({selected_doc_label_2})**")
+                ignore_punc_grid_display = st.checkbox("比对和显示时忽略所有标点符号", value=False, key="cb_ignore_punc_grid")
+                text_A_for_grid = doc_data_1['full_raw_text']
+                text_B_for_grid = doc_data_2['full_raw_text']
+                with st.spinner("生成字符网格..."):
+                    aligned_A_grid_chars, aligned_B_grid_chars = CharacterGridAligner.align_full_texts_for_grid(text_A_for_grid, text_B_for_grid, ignore_punc_grid_display)
+                
+                if aligned_A_grid_chars or aligned_B_grid_chars:
+                    grid_html_content = CharacterGridAligner.create_grid_html_for_full_docs(selected_doc_label_1, selected_doc_label_2, aligned_A_grid_chars, aligned_B_grid_chars, chars_per_line_grid) # Use current chars_per_line_grid from sidebar
+                    st.components.v1.html(grid_html_content, height=700, scrolling=True)
+                    st.download_button(f"📥 下载 {selected_doc_label_1}-{selected_doc_label_2} 网格 (HTML)", grid_html_content, f"grid_{selected_doc_label_1}_{selected_doc_label_2}.html", "text/html", key=f"html_dl_{selected_doc_label_1}_{selected_doc_label_2}_{int(time.time())}")
+                else:
+                    st.info("选择的文档内容为空或处理后为空，无法生成字符网格。")
+
+            with tab_stats:
+                st.markdown(f"#### 文档对齐分布图: **{doc_data_1['filename']} ({selected_doc_label_1})** vs **{doc_data_2['filename']} ({selected_doc_label_2})**")
+                current_alignment_table_for_dist = st.session_state.alignment_table_cache.get(cache_key_align, []) # Uses same cache key as tab_align
+                if not current_alignment_table_for_dist:
+                    st.info("请先在“对齐表格视图”标签页生成对齐数据，或当前参数下无对齐结果。")
+                else:
+                    plot_data = []
+                    max_index_a = 0
+                    max_index_b = 0
+                    for item in current_alignment_table_for_dist:
+                        if item.get('matched', False) and item['segment_a'] and item['segment_b']:
+                            doc_a_idx_1based = item['segment_a']['index'] + 1
+                            doc_b_idx_1based = item['segment_b']['index'] + 1
+                            plot_data.append({'doc_A_index': doc_a_idx_1based, 'doc_B_index': doc_b_idx_1based, 'similarity': item['similarity'], 'type': 'Matched Pair', 'text_A': item['segment_a']['text'][:30] + "...", 'text_B': item['segment_b']['text'][:30] + "...", 'id_A': item['segment_a']['id'], 'id_B': item['segment_b']['id']})
+                            max_index_a = max(max_index_a, doc_a_idx_1based)
+                            max_index_b = max(max_index_b, doc_b_idx_1based)
+                        elif item['segment_a'] and not item['segment_b']:
+                            doc_a_idx_1based = item['segment_a']['index'] + 1
+                            plot_data.append({'doc_A_index': doc_a_idx_1based, 'doc_B_index': 0, 'similarity': 0, 'type': f'{selected_doc_label_1} Only', 'text_A': item['segment_a']['text'][:30] + "...", 'text_B': "", 'id_A': item['segment_a']['id'], 'id_B': ""})
+                            max_index_a = max(max_index_a, doc_a_idx_1based)
+                        elif item['segment_b'] and not item['segment_a']:
+                            doc_b_idx_1based = item['segment_b']['index'] + 1
+                            plot_data.append({'doc_A_index': 0, 'doc_B_index': doc_b_idx_1based, 'similarity': 0, 'type': f'{selected_doc_label_2} Only', 'text_A': "", 'text_B': item['segment_b']['text'][:30] + "...", 'id_A': "", 'id_B': item['segment_b']['id']})
+                            max_index_b = max(max_index_b, doc_b_idx_1based)
+                    
+                    if not plot_data:
+                        st.info("没有可供可视化的对齐数据。")
+                    else:
+                        df_plot = pd.DataFrame(plot_data)
+                        available_colorscales = ['Viridis', 'Plasma', 'Inferno', 'Magma', 'Cividis', 'Pinkyl', 'Blues', 'Greens', 'Reds', 'YlOrRd', 'YlGnBu', 'Hot', 'Electric', 'Rainbow', 'Plotly3']
+                        if 'selected_colorscale' not in st.session_state:
+                            st.session_state.selected_colorscale = "Pinkyl"
+                        st.session_state.selected_colorscale = st.selectbox("选择配色方案:", available_colorscales, index=available_colorscales.index(st.session_state.selected_colorscale), key="scatter_colorscale_selector")
                         
-                        if not plot_data:
-                            st.info("没有可供可视化的对齐数据。")
-                        else:
-                            df_plot = pd.DataFrame(plot_data)
-                            
-                            # Adjust placeholder indices for better visualization if needed
-                            # For "A Only", make them appear along the bottom/left edge.
-                            # For "B Only", make them appear along the top/right edge.
-                            # This requires careful setting of plot ranges.
-                            # A simpler approach is a categorical 'type' for color/symbol.
-
-                            fig_dist = px.scatter(
-                                df_plot,
-                                x='doc_A_index',
-                                y='doc_B_index',
-                                color='similarity', # Color matched pairs by similarity
-                                symbol='type',    # Different symbols for Matched, A Only, B Only
-                                size=[1.5 if t == 'Matched Pair' else 0.8 for t in df_plot['type']],# Reduced size for better visualization
-                                hover_data=['id_A', 'id_B', 'text_A', 'text_B', 'similarity'],
-                                color_continuous_scale="Pinkyl", # For similarity
-                                range_color=[0,1], # Similarity range
-                                title="段落对齐分布图",
-                                labels={
-                                    'doc_A_index': f'文档 {selected_doc_label_1} 段落序号',
-                                    'doc_B_index': f'文档 {selected_doc_label_2} 段落序号',
-                                    'similarity': '相似度'
-                                }
-                            )
-                            # Customize axes for unmatched (negative indices are placeholders)
-                            fig_dist.update_xaxes(range=[-10, max_index_a + 10])
-                            fig_dist.update_yaxes(range=[-10, max_index_b + 10])
-                            
-                            fig_dist.update_layout(height=600, legend_title_text='段落类型')
-                            st.plotly_chart(fig_dist, use_container_width=True)
-
-                            st.markdown("""
-                            **图表解读:**
-                            - **点的位置**: X轴表示段落在文档A中的序号，Y轴表示段落在文档B中的序号。
-                            - **颜色 (Matched Pair)**: 颜色的深浅表示匹配段落对之间的相似度（越接近1，颜色越亮/特定）。
-                            - **形状 (Symbol)**: 
-                                - "Matched Pair": 表示在两个文档中都找到了对应且相似度高于阈值的段落。
-                                - "文档A Only" / "文档B Only": 表示该段落仅在一个文档中，或在另一文档中未找到相似度足够的匹配。这些点会显示在图表的边缘（负数坐标轴位置）。
-                            - **鼠标悬停**: 查看段落ID、预览文本和确切相似度。
-                            - **对角线趋势**: 如果两个文档内容和顺序高度相似，匹配点会趋向于沿对角线分布。
-                            """) 
+                        fig_dist = px.scatter(df_plot, x='doc_A_index', y='doc_B_index', color='similarity', 
+                                            hover_data=['id_A', 'id_B', 'text_A', 'text_B', 'similarity'], 
+                                            color_continuous_scale=st.session_state.selected_colorscale, range_color=[0,1],
+                                            title="段落对齐分布图", 
+                                            labels={'doc_A_index': f'文档 {selected_doc_label_1} 段落序号', 
+                                                    'doc_B_index': f'文档 {selected_doc_label_2} 段落序号', 
+                                                    'similarity': '相似度'})
+                        fig_dist.update_traces(marker=dict(size=5))
+                        current_max_a = max(1, max_index_a); current_max_b = max(1, max_index_b)
+                        fig_dist.update_xaxes(range=[0, current_max_a + 1]); fig_dist.update_yaxes(range=[0, current_max_b + 1])
+                        if max_index_a > 0 or max_index_b > 0:
+                            max_val_for_diag = max(max_index_a, max_index_b, 0)
+                            fig_dist.add_shape(type="line", x0=1, y0=1, x1=max_val_for_diag, y1=max_val_for_diag, line=dict(color="rgba(128, 128, 128, 0.5)", width=1, dash="dash"))
+                        fig_dist.update_layout(height=600, legend_title_text='段落类型', margin=dict(l=40, r=40, t=50, b=40))
+                        st.plotly_chart(fig_dist, use_container_width=True)
+                        st.markdown("""**图表解读:**
+                        - **散点位置:** 每个点代表一个段落（或一对匹配的段落）。X轴和Y轴分别表示其在文档A和文档B中的序号。
+                        - **颜色深浅:** 颜色越深（或根据色阶变化），表示匹配段落间的相似度越高。
+                        - **对角线参考:** 图中可能包含一条虚线对角线 (y=x)。靠近这条线的点表明段落在两个文档中的相对顺序相似。
+                        - **悬停信息:** 将鼠标悬停在点上可以查看段落ID、内容片段和具体相似度得分。
+                        - **仅在一个文档中出现的段落:** 可能会显示在X轴或Y轴的零点附近（或图表边缘），表示它们在另一文档中没有对应匹配。""")
+        elif not st.session_state.all_docs_processed_at_least_once : # Data not found, and processing hasn't happened for this selection
+             st.info("👈 请点击侧边栏的“处理所有已上传文档”按钮以使用当前设置生成对比结果。")
+        else: # Data not found, but all_docs_processed_at_least_once is true (e.g. error during processing, or data cleared unexpectedly)
+             st.warning("选定文档的数据不存在或不完整。请尝试重新点击“处理所有已上传文档”。")
+    
+    # Fallback for any other unhandled state
     else:
-        st.info("👈 请在侧边栏上传并处理文档以开始分析。")
+        if not st.session_state.processing_underway: # Avoid showing this if a spinner is already active
+            st.info("👈 请在侧边栏进行操作以开始分析。")
 
 
 if __name__ == "__main__":
