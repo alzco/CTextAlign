@@ -8,3 +8,4 @@ PyPDF2==3.0.1
 markdown==3.5.2
 beautifulsoup4==4.12.3
 plotly==5.18.0
+openpyxl==3.1.2
