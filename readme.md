@@ -4,6 +4,10 @@
 
 CTextAlign是一个部署在streamlit上的中文文本对齐工具，可以自动识别两个文档之间的相似段落，并提供字符级别的网格式对比界面，帮助研究人员快速发现并阅读文本差异。
 
+## 在线使用
+
+CTextAlign已托管在Streamlit Cloud上，提供在线使用界面，点击[这里](https://ctextalign.streamlit.app/)即可访问。长期未使用可能会休眠，需要重新启动。上传的文档仅在当前会话中保留，关闭浏览器后将被清空。
+
 ## 主要功能
 
 1. **文本分段**：基于原始文本的标点和换行符进行智能分段
@@ -33,20 +37,35 @@ CTextAlign是一个部署在streamlit上的中文文本对齐工具，可以自�
 - **紧凑网格布局**：使用正方形网格单元格和紧凑的行间距，提高可读性。
 - **可视化分析**：提供多种图表帮助理解文本相似性和差异
 
-## 安装依赖
-
-```bash
-pip install -r requirements.txt
-```
-
-## 运行应用
-
-```bash
-streamlit run streamlit_app.py
-```
-
 ## 适用场景
 
 - 中文古籍不同版本的校对和比较
 - 文学作品的修订版本对比
 - 相似文本的变体研究
+
+## 本地安装
+
+### 环境准备
+
+1. 安装Python 3.8或更高版本
+
+2. 安装Streamlit
+
+```bash
+pip install streamlit
+```
+
+3. 建议在虚拟环境中运行
+
+### 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+### 运行应用
+
+```bash
+streamlit run streamlit_app.py
+```
+
