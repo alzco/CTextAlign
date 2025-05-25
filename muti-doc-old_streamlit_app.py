@@ -297,13 +297,9 @@ class ChineseSimilarityMatcher:
         self.vectorizer = TfidfVectorizer(analyzer=chinese_analyzer, min_df=1)
 
     def find_best_matches(self,
-                      segments_data_A: List[Dict],
-                      segments_data_B: List[Dict],
-                      threshold: float = 0.6,
-                      max_batch_size: int = 500) -> List[Dict]:
-        """寻找两组文本段落之间的最佳匹配
-        优化版本：保持稀疏矩阵格式，大文档分块处理，减少内存使用
-        """
+                          segments_data_A: List[Dict],
+                          segments_data_B: List[Dict],
+                          threshold: float = 0.6) -> List[Dict]:
         if not segments_data_A or not segments_data_B:
             alignment_table = []
             for i, seg_a_data in enumerate(segments_data_A):
@@ -319,45 +315,28 @@ class ChineseSimilarityMatcher:
         clean_texts_B = [ChineseTextProcessor.remove_punctuation(t, keep_space=False, keep_newline=False) for t in texts_B]
         
         # Filter out potentially empty strings after punctuation removal for TF-IDF
+        # Store original indices to map back if needed, though here we operate on full lists
         valid_clean_A = [t for t in clean_texts_A if t.strip()]
         valid_clean_B = [t for t in clean_texts_B if t.strip()]
 
         if not valid_clean_A or not valid_clean_B: # If one list becomes all empty
-            # 如果清理后没有有效文本，创建零矩阵
             similarity_matrix = np.zeros((len(texts_A), len(texts_B)))
         else:
-            # 拟合向量化器 - 这一步可以使用所有文本
             all_valid_clean_texts = valid_clean_A + valid_clean_B
             self.vectorizer.fit(all_valid_clean_texts)
             
-            # 转换文本为向量，保持稀疏矩阵格式（不使用.toarray()）
-            sparse_vectors_A = self.vectorizer.transform(clean_texts_A)
-            sparse_vectors_B = self.vectorizer.transform(clean_texts_B)
+            # Transform original clean_texts lists (they might contain empty strings where valid_clean_* do not)
+            vectors_A = self.vectorizer.transform(clean_texts_A).toarray()
+            vectors_B = self.vectorizer.transform(clean_texts_B).toarray()
             
-            # 检查向量有效性
-            if sparse_vectors_A.shape[1] == 0 or sparse_vectors_B.shape[1] == 0:
+            if vectors_A.shape[1] == 0 or vectors_B.shape[1] == 0 or vectors_A.size == 0 or vectors_B.size == 0:
                 similarity_matrix = np.zeros((len(texts_A), len(texts_B)))
             else:
                 try:
-                    # 通过批处理计算相似度矩阵，避免一次性操作大型稀疏矩阵
-                    if len(segments_data_A) > max_batch_size or len(segments_data_B) > max_batch_size:
-                        # 针对大型文档分块处理
-                        similarity_matrix = np.zeros((len(texts_A), len(texts_B)))
-                        # 按批次处理A中的段落
-                        for i in range(0, len(segments_data_A), max_batch_size):
-                            batch_A = sparse_vectors_A[i:min(i+max_batch_size, len(segments_data_A))]
-                            # 对每批A中的段落，计算与所有B段落的相似度
-                            batch_sim = cosine_similarity(batch_A, sparse_vectors_B, dense_output=False)
-                            # 将结果复制到完整矩阵 - 这里batch_sim是一个稀疏矩阵，转换为numpy数组以存储到结果中
-                            similarity_matrix[i:min(i+max_batch_size, len(segments_data_A)), :] = batch_sim.toarray()
-                    else:
-                        # 对于较小的文档，直接计算，但仍保持稀疏格式直到最后需要时才转换
-                        similarity_matrix = cosine_similarity(sparse_vectors_A, sparse_vectors_B, dense_output=True)
-                except ValueError as e:
-                    print(f"计算相似度时出错: {e}")
+                    similarity_matrix = cosine_similarity(vectors_A, vectors_B)
+                except ValueError:
                     similarity_matrix = np.zeros((len(texts_A), len(texts_B)))
         
-        # 构建对齐表 - 这部分保持不变，因为它对内存使用影响较小
         alignment_table = []
         used_b_indices = set()
 
